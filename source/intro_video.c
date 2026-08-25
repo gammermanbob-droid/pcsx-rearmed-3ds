@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "psx3ds.h"
 
@@ -99,6 +100,21 @@ static bool mvdInitWithTimeout(void) {
     return R_SUCCEEDED(s_mvdInitResult);
 }
 
+// Diagnostic-only: introVideoInit() has many independent bail-out
+// points (New3DS check, romfs read, allocation, MVD service init,
+// config, NAL scan) and every one of them looks identical from the
+// outside -- "no real intro, fell back to the logo" -- so there's no
+// way to tell which one is actually firing on a given device without
+// this. Appends rather than truncates so a full boot's story survives
+// even if something after this crashes outright.
+static void introLog(const char* msg) {
+    FILE* f = fopen("sdmc:/3ds/pcsx_rearmed_3ds/intro_debug.log", "a");
+    if (f) {
+        fprintf(f, "%s\n", msg);
+        fclose(f);
+    }
+}
+
 static bool findStartCode(size_t from, size_t* outPos) {
     if (from + 3 > s_fileSize) {
         return false;
@@ -166,6 +182,10 @@ static bool decodeUntilFrame(void) {
         MVDSTD_ProcessNALUnitOut out;
         Result res = mvdstdProcessVideoFrame(s_naluScratch, r.length + 3, 0, &out);
         if (!MVD_CHECKNALUPROC_SUCCESS((u32)res)) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "bail: mvdstdProcessVideoFrame failed at NAL #%d, res=0x%08lx",
+                s_naluCursor - 1, (unsigned long)res);
+            introLog(buf);
             return false;
         }
         if ((u32)res == MVD_STATUS_PARAMSET || (u32)res == MVD_STATUS_INCOMPLETEPROCESSING) {
@@ -174,10 +194,15 @@ static bool decodeUntilFrame(void) {
 
         Result renderRes = mvdstdRenderVideoFrame(NULL, true);
         if (R_FAILED(renderRes)) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "bail: mvdstdRenderVideoFrame failed at NAL #%d, res=0x%08lx",
+                s_naluCursor - 1, (unsigned long)renderRes);
+            introLog(buf);
             return false;
         }
         return true;
     }
+    introLog("decodeUntilFrame: reached end of NAL list (normal end of clip)");
     return false;
 }
 
@@ -190,44 +215,82 @@ bool introVideoInit(void) {
     // its own (see core_glue.c), which was the other prime suspect in
     // that build, so this is the first time the video path is being
     // tested alone with the RSF fix in place.
+    // This runs before any game has been loaded, so unlike
+    // core_glue.c's SYSTEM_DIR/SAVE_DIR (created lazily on first game
+    // load) or settings.c's own dir (created on first settings
+    // change), sdmc:/3ds/pcsx_rearmed_3ds/ may not exist yet on a
+    // fresh install -- without this, the log below would silently
+    // fail to open every single time and produce nothing to look at.
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/pcsx_rearmed_3ds", 0777);
+
+    // Truncate rather than append here (introVideoInit() only ever
+    // runs once per app launch, at boot) so each test run's log is a
+    // clean, unambiguous record instead of piling onto whatever a
+    // previous session already wrote.
+    FILE* truncateLog = fopen("sdmc:/3ds/pcsx_rearmed_3ds/intro_debug.log", "w");
+    if (truncateLog) {
+        fclose(truncateLog);
+    }
+    introLog("introVideoInit: start");
+
     bool isNew3ds = false;
-    if (R_FAILED(APT_CheckNew3DS(&isNew3ds)) || !isNew3ds) {
+    Result checkRes = APT_CheckNew3DS(&isNew3ds);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "APT_CheckNew3DS: res=0x%08lx isNew3ds=%d",
+        (unsigned long)checkRes, (int)isNew3ds);
+    introLog(buf);
+    if (R_FAILED(checkRes) || !isNew3ds) {
+        introLog("bail: not New3DS (or check failed)");
         return false;
     }
 
     FILE* f = fopen("romfs:/intro_video.h264", "rb");
     if (!f) {
+        introLog("bail: fopen romfs:/intro_video.h264 failed");
         return false;
     }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (size <= 0) {
+        introLog("bail: intro_video.h264 empty/ftell failed");
         fclose(f);
         return false;
     }
     s_fileData = (u8*)malloc((size_t)size);
     if (!s_fileData) {
+        introLog("bail: malloc(s_fileData) failed");
         fclose(f);
         return false;
     }
     size_t read = fread(s_fileData, 1, (size_t)size, f);
     fclose(f);
     if (read != (size_t)size) {
+        snprintf(buf, sizeof(buf), "bail: fread got %zu of %ld bytes", read, size);
+        introLog(buf);
         free(s_fileData);
         s_fileData = NULL;
         return false;
     }
     s_fileSize = (size_t)size;
+    snprintf(buf, sizeof(buf), "loaded intro_video.h264: %zu bytes", s_fileSize);
+    introLog(buf);
 
     s_outBuf = (u16*)linearAlloc((size_t)INTRO_WIDTH * INTRO_HEIGHT * sizeof(u16));
     s_naluScratch = (u8*)linearAlloc(NALU_SCRATCH_SIZE);
     if (!s_outBuf || !s_naluScratch) {
+        introLog("bail: linearAlloc(s_outBuf/s_naluScratch) failed");
         introVideoExit();
         return false;
     }
 
-    if (!mvdInitWithTimeout()) {
+    introLog("calling mvdInitWithTimeout()...");
+    bool mvdOk = mvdInitWithTimeout();
+    snprintf(buf, sizeof(buf), "mvdInitWithTimeout: %s (res=0x%08lx, timed_out=%d)",
+        mvdOk ? "ok" : "FAILED", (unsigned long)s_mvdInitResult, (int)!s_mvdInitThreadDone);
+    introLog(buf);
+    if (!mvdOk) {
         // Not marking s_mvdReady here even on the timeout path -- if
         // mvdstdInit() really is still stuck in the abandoned thread,
         // calling mvdstdExit() concurrently from here would race
@@ -240,13 +303,19 @@ bool introVideoInit(void) {
     MVDSTD_Config config;
     mvdstdGenerateDefaultConfig(&config, INTRO_WIDTH, INTRO_HEIGHT, INTRO_WIDTH, INTRO_HEIGHT,
         NULL, (u32*)s_outBuf, NULL);
-    if (R_FAILED(MVDSTD_SetConfig(&config))) {
+    Result setConfigRes = MVDSTD_SetConfig(&config);
+    if (R_FAILED(setConfigRes)) {
+        snprintf(buf, sizeof(buf), "bail: MVDSTD_SetConfig failed, res=0x%08lx", (unsigned long)setConfigRes);
+        introLog(buf);
         introVideoExit();
         return false;
     }
 
     scanNalus();
+    snprintf(buf, sizeof(buf), "scanNalus: found %d NAL units", s_naluCount);
+    introLog(buf);
     if (s_naluCount == 0) {
+        introLog("bail: 0 NAL units found (bad/truncated intro_video.h264?)");
         introVideoExit();
         return false;
     }
@@ -255,6 +324,7 @@ bool introVideoInit(void) {
     s_holdTicks = 0;
 
     audioPlayClip("romfs:/boot_chime.pcm", 44100.0f, false);
+    introLog("introVideoInit: success, playback starting");
     return true;
 }
 

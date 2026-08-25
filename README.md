@@ -72,15 +72,20 @@ cleanly. See that file's own comments for the full story.
   acceleration to fall back on. 2D-heavy games run much closer to
   full speed.
 - The boot intro plays the real PS1 startup video on New3DS via the
-  console's own MVD hardware decoder, falling back to an animated
-  logo everywhere else (Old 3DS, or if decode setup fails). This is
-  the newest, least-hardware-tested part of the app -- an earlier
-  version of this hung the whole app on boot instead of falling back,
-  since fixed (RSF service permissions) and further hardened (the risk
-  service call now runs under a timeout so a repeat failure can't take
-  the app down again), but real-hardware confirmation is still
-  ongoing. If the app doesn't boot at all on your device, that's the
-  first thing to report.
+  console's own MVD hardware decoder, falling back to an animated logo
+  everywhere else (Old 3DS, or if decode setup fails). This is the
+  newest, least-hardware-tested part of the app -- an earlier version
+  hung the whole app on boot instead of falling back; that's since
+  been hardened so it can't happen again (`mvdstdInit()` now runs
+  under a watchdog timeout), but **whether the real video actually
+  plays on genuine New3DS hardware is still unconfirmed** -- all
+  development testing has been through the Azahar 3DS emulator, which
+  has never implemented the MVD service at all (every function is an
+  unimplemented stub), so it can only confirm the fallback path works,
+  never the real one. If you test this and it always falls back to the
+  logo, check `sdmc:/3ds/pcsx_rearmed_3ds/intro_debug.log` (rewritten
+  fresh each boot) and paste it into an issue -- it pinpoints exactly
+  which step failed.
 
 Bug reports, compatibility notes, and performance feedback --
 especially from New3DS/New2DS testers -- are welcome as
