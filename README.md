@@ -56,10 +56,10 @@ python3 package_cia.py
 (`--makerom`, `--bannertool`, `--rsf-template`) if yours aren't in the
 default locations. **The RSF template must declare the `mvd:STD`
 service** under `AccessControlInfo/ServiceAccessControl` (and
-`mvd: 0x0004013020004102` under `SystemControlInfo/Dependency`) if
-you ever re-enable the New3DS hardware video decode path in
-`source/intro_video.c` -- see that file's own comments for why it's
-currently disabled.
+`mvd: 0x0004013020004102` under `SystemControlInfo/Dependency`) for
+the New3DS hardware video decode path (`source/intro_video.c`) to work
+-- without it, the app can hang on boot instead of falling back
+cleanly. See that file's own comments for the full story.
 
 ## Status / known limitations
 
@@ -71,10 +71,16 @@ currently disabled.
   running entirely on the console's own CPU, with no hardware 3D
   acceleration to fall back on. 2D-heavy games run much closer to
   full speed.
-- A hardware-decoded boot intro (via the New3DS MVD video service) was
-  attempted and hung the app on real hardware for reasons not fully
-  root-caused; the code is still present in `source/intro_video.c` but
-  disabled (`introVideoInit()` returns `false` unconditionally).
+- The boot intro plays the real PS1 startup video on New3DS via the
+  console's own MVD hardware decoder, falling back to an animated
+  logo everywhere else (Old 3DS, or if decode setup fails). This is
+  the newest, least-hardware-tested part of the app -- an earlier
+  version of this hung the whole app on boot instead of falling back,
+  since fixed (RSF service permissions) and further hardened (the risk
+  service call now runs under a timeout so a repeat failure can't take
+  the app down again), but real-hardware confirmation is still
+  ongoing. If the app doesn't boot at all on your device, that's the
+  first thing to report.
 
 Bug reports, compatibility notes, and performance feedback --
 especially from New3DS/New2DS testers -- are welcome as

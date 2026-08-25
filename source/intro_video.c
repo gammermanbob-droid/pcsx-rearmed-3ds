@@ -55,6 +55,50 @@ static bool s_mvdReady;
 static bool s_done;
 static int s_holdTicks;
 
+// mvdstdInit() is the one call in this whole file that reaches an
+// actual 3DS system service (mvd:STD) rather than just our own
+// buffers -- exactly the kind of call that hung the app outright on
+// real hardware once already (see introVideoInit's own comment). A
+// service-permission fix was applied since, but it was never verified
+// in isolation, so this still runs it on a throwaway thread with a
+// hard timeout rather than trusting it can't hang again: if it
+// doesn't finish in time, the thread (and its small stack) is simply
+// abandoned -- there's no safe way to force-cancel a blocked syscall/
+// IPC call on 3DS -- and introVideoInit() falls back exactly like any
+// other failure. A one-time few-KB leak in the timeout case is a
+// trivial cost next to "the app doesn't boot at all."
+static volatile bool s_mvdInitThreadDone;
+static volatile Result s_mvdInitResult;
+
+static void mvdInitThreadFunc(void* arg) {
+    (void)arg;
+    s_mvdInitResult = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264,
+        MVD_OUTPUT_RGB565, MVD_DEFAULT_WORKBUF_SIZE, NULL);
+    s_mvdInitThreadDone = true;
+}
+
+// Returns false if mvdstdInit() failed OR didn't finish within the
+// timeout -- caller can't tell which, but doesn't need to: either way
+// MVD isn't usable and introVideoInit() should fall back.
+static bool mvdInitWithTimeout(void) {
+    s_mvdInitThreadDone = false;
+    Thread t = threadCreate(mvdInitThreadFunc, NULL, 4 * 1024, 0x3F, -2, true);
+    if (!t) {
+        return false;
+    }
+    // ~3 seconds at ~16ms/tick -- generous for a real service call
+    // under normal conditions, short enough that a genuine hang still
+    // resolves to the fallback boot screen quickly rather than the
+    // player staring at a black screen wondering if the app is dead.
+    for (int i = 0; i < 180 && !s_mvdInitThreadDone; ++i) {
+        svcSleepThread(16 * 1000 * 1000);
+    }
+    if (!s_mvdInitThreadDone) {
+        return false; // still stuck -- abandon it, thread was created detached
+    }
+    return R_SUCCEEDED(s_mvdInitResult);
+}
+
 static bool findStartCode(size_t from, size_t* outPos) {
     if (from + 3 > s_fileSize) {
         return false;
@@ -138,19 +182,14 @@ static bool decodeUntilFrame(void) {
 }
 
 bool introVideoInit(void) {
-    // Disabled for now -- this hung the whole app on real hardware
-    // (not just a failed/skipped intro: nothing loaded at all, not
-    // even the fallback boot screen), and an exheader fix for the
-    // most likely cause (missing mvd:STD service access -- see
-    // package_cia.py) made no observed difference, meaning either
-    // that wasn't the actual cause or there's a second problem behind
-    // it. Bailing out before anything below runs (no APT_CheckNew3DS,
-    // no romfs read, no MVD calls at all) rules this file out entirely
-    // as a variable while that gets root-caused for real, rather than
-    // shipping another guess against hardware nobody in this
-    // conversation can directly test on.
-    return false;
-
+    // Re-enabled: was shipped once alongside auto-frameskip in the
+    // same build, hung the app, and a first exheader fix (missing
+    // mvd:STD service access -- see package_cia.py) made no observed
+    // difference -- but that test never isolated this file from
+    // frameskip. Frameskip has since been re-confirmed working fine on
+    // its own (see core_glue.c), which was the other prime suspect in
+    // that build, so this is the first time the video path is being
+    // tested alone with the RSF fix in place.
     bool isNew3ds = false;
     if (R_FAILED(APT_CheckNew3DS(&isNew3ds)) || !isNew3ds) {
         return false;
@@ -188,8 +227,11 @@ bool introVideoInit(void) {
         return false;
     }
 
-    if (R_FAILED(mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_RGB565,
-            MVD_DEFAULT_WORKBUF_SIZE, NULL))) {
+    if (!mvdInitWithTimeout()) {
+        // Not marking s_mvdReady here even on the timeout path -- if
+        // mvdstdInit() really is still stuck in the abandoned thread,
+        // calling mvdstdExit() concurrently from here would race
+        // against it instead of cleanly tearing down.
         introVideoExit();
         return false;
     }
